@@ -3,6 +3,7 @@ import type { Sentiment } from "@prisma/client";
 import { db } from "@/lib/db";
 import { createEmbedding } from "@/lib/embeddings";
 import { Prisma } from "@prisma/client";
+import { generateText, isAiConfigured } from "@/lib/ai/llm";
 
 const classificationSchema = z.object({
   sentiment: z.enum(["POS", "NEU", "NEG"]),
@@ -38,19 +39,13 @@ export function fallbackClassification(content: string): Classification {
 }
 
 async function classifyWithClaude(content: string, existingThemes: string[]): Promise<Classification> {
-  if (!process.env.ANTHROPIC_API_KEY) return fallbackClassification(content);
-  const Anthropic = (await import("@anthropic-ai/sdk")).default;
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const response = await client.messages.create({
-    model: process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6",
-    max_tokens: 500,
+  if (!isAiConfigured() || process.env.AI_CLASSIFICATION === "off") return fallbackClassification(content);
+  const text = await generateText({
     system: "You classify customer feedback. Return only valid JSON matching the requested schema. sentiment must be POS, NEU, or NEG; sentimentScore must be between -1 and 1. Reuse an existing theme when it is a reasonable fit. Create a new concise theme only when none fits. Return no markdown, commentary, or code fences.",
-    messages: [{
-      role: "user",
-      content: `Existing themes: ${existingThemes.length ? existingThemes.join(", ") : "None yet"}\n\nClassify this feedback as JSON with keys sentiment, sentimentScore, themes (array), featureArea, rationale. Keep rationale to one sentence.\n\nFeedback:\n${content}`
-    }]
+    user: `Existing themes: ${existingThemes.length ? existingThemes.join(", ") : "None yet"}\n\nClassify this feedback as JSON with keys sentiment, sentimentScore, themes (array), featureArea, rationale. Keep rationale to one sentence.\n\nFeedback:\n${content}`,
+    maxTokens: 500,
+    json: true
   });
-  const text = response.content.map((part) => part.type === "text" ? part.text : "").join("").trim();
   const json = text.match(/\{[\s\S]*\}/)?.[0];
   if (!json) throw new Error("CLASSIFICATION_INVALID");
   return classificationSchema.parse(JSON.parse(json));
@@ -65,11 +60,11 @@ export async function classifyAndPersist(feedbackId: string, workspaceId: string
   try {
     result = await classifyWithClaude(feedback.content, existingThemes.map((theme) => theme.name));
   } catch (firstError) {
-    if (!process.env.ANTHROPIC_API_KEY) throw firstError;
+    if (!isAiConfigured()) throw firstError;
     try {
       result = await classifyWithClaude(feedback.content, existingThemes.map((theme) => theme.name));
     } catch (secondError) {
-      console.error("Claude classification failed after retry", secondError);
+      console.error("AI classification failed after retry", secondError);
       result = fallbackClassification(feedback.content);
       classificationStatus = "MANUAL_REVIEW";
     }
